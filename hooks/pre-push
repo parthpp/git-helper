@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+#
+# pre-push: on push to main/master, list commits missing a Jira trailer,
+# with lines over 80 chars (URLs excepted), or a non-blank line 2, and
+# ask y/n to push anyway. Without a terminal it only warns and pushes.
+#
+# Install, per repo:
+#   ln -s ~/git-helper/hooks/pre-push .git/hooks/
+
+# Stop on the first failing command (-e), on unset variables (-u), and
+# when any command in a pipeline fails (-o pipefail).
+set -euo pipefail
+
+# --- Settings --------------------------------------------------------------
+WIDTH=80                                    # longer message lines get a warning
+JIRA_KEY=Jira                               # trailer token, as in "Jira: PROJ-123"
+# Jira project key, only for the example in the hint (default: PROJ).
+PREFIX=$(git config --get githelper.ticketPrefix || echo PROJ)
+TARGET_RE='^refs/heads/(main|master)$'      # remote branches that are checked
+
+# --- State -------------------------------------------------------------------
+# Git passes the remote's name and URL as arguments, and one line per
+# ref being pushed on stdin: <local ref> <local sha> <remote ref> <remote sha>
+missing=()     # "<short sha> <subject>" of commits without the trailer
+badly_formatted=()  # "<short sha> <subject>: <problem>", one per problem
+
+# --- Steps -------------------------------------------------------------------
+
+is_zero() { [[ $1 =~ ^0+$ ]]; }  # git's all-zero id: no such commit
+
+# Subject length, blank line 2, then long lines (URLs exempt); the
+# length rules are the same as line_warnings in git-squash-merge. Reads
+# a message on stdin.
+line_warnings() {
+  local line number=0
+  # ${#line} counts characters only in a UTF-8 locale, so force one here.
+  # ("é" and "—" are one character each, but two and three bytes.)
+  local LC_ALL=C.UTF-8
+  while IFS= read -r line || [[ -n $line ]]; do
+    number=$((number + 1))
+    if (( number == 1 )); then
+      if (( ${#line} > WIDTH )); then
+        printf 'subject is %d chars (max %d)\n' "${#line}" "$WIDTH"
+      fi
+      continue
+    fi
+    if (( number == 2 )) && [[ -n $line ]]; then
+      echo "line 2 is not blank, so git treats lines 1-2 as the subject"
+    fi
+    if (( ${#line} > WIDTH )) && [[ $line != *://* ]]; then
+      printf 'line %d is %d chars (max %d)\n' "$number" "${#line}" "$WIDTH"
+    fi
+  done
+}
+
+find_commits_without_trailer() {  # add commits in $@ to $missing
+  local line
+  # One line per commit: its Jira trailer values (empty if none), a
+  # tab, then the short sha and subject.
+  while IFS= read -r line; do
+    missing+=("$line")
+  done < <(git log --no-merges \
+             --format="%(trailers:key=$JIRA_KEY,valueonly,separator=%x2C)%x09%h %s" \
+             "$@" | sed -n 's/^\t//p')
+}
+
+find_badly_formatted_commits() {  # add commits in $@ to $badly_formatted
+  local sha commit problem
+  while IFS= read -r sha; do
+    commit=$(git log -1 --format='%h %s' "$sha")
+    while IFS= read -r problem; do
+      badly_formatted+=("$commit: $problem")
+    done < <(git log -1 --format=%B "$sha" | line_warnings)
+  done < <(git rev-list --no-merges "$@")
+}
+
+check_pushed_commits() {  # check the commits each ref on stdin pushes
+  local local_ref local_sha remote_ref remote_sha range
+  while read -r local_ref local_sha remote_ref remote_sha; do
+    if [[ ! $remote_ref =~ $TARGET_RE ]] || is_zero "$local_sha"; then
+      continue  # another branch, or a delete
+    fi
+    if is_zero "$remote_sha"; then
+      range=("$local_sha" --not --remotes)  # new branch: what no remote has
+    else
+      range=("$remote_sha..$local_sha")
+    fi
+    find_commits_without_trailer "${range[@]}"
+    find_badly_formatted_commits "${range[@]}"
+  done
+}
+
+report() {  # list the commits found, under one heading per problem
+  if (( ${#missing[@]} > 0 )); then
+    printf 'warning: these commits have no %s trailer:\n' "$JIRA_KEY" >&2
+    printf '  %s\n' "${missing[@]}" >&2
+    printf "Amend them to add '%s: %s-123' if there is a ticket.\n" \
+      "$JIRA_KEY" "$PREFIX" >&2
+  fi
+  if (( ${#badly_formatted[@]} > 0 )); then
+    printf 'warning: these commit messages break the line rules:\n' >&2
+    printf '  %s\n' "${badly_formatted[@]}" >&2
+    printf 'Amend them to keep line 2 blank and lines within %d characters\n' \
+      "$WIDTH" >&2
+    printf '(lines containing a URL are exempt).\n' >&2
+  fi
+}
+
+# With a terminal, ask until the answer is y or n; only "y" pushes.
+ask_to_push_anyway() {
+  local tty=${GIT_JIRA_TTY:-/dev/tty} reply
+  # Git gives stdin to the ref list, so talk to the terminal directly. No
+  # terminal (e.g. an IDE): carry on with the push.
+  if ! { exec 3< "$tty"; } 2>/dev/null; then
+    return 0
+  fi
+  while true; do
+    printf 'Push anyway? [y/n] ' >&2
+    reply=
+    # No more input at all (e.g. Ctrl-D): there will never be an answer,
+    # so stop rather than ask forever.
+    if ! read -r reply <&3 && [[ -z $reply ]]; then
+      echo >&2
+      reply=n
+    fi
+    case $reply in
+      [yY]) exec 3<&-; return 0 ;;
+      [nN]) exec 3<&-
+            echo "error: push stopped; nothing was pushed" >&2
+            exit 1 ;;
+      *)    echo "Please answer y (push) or n (stop the push)." >&2 ;;
+    esac
+  done
+}
+
+# --- Main ----------------------------------------------------------------------
+
+main() {
+  check_pushed_commits
+  if (( ${#missing[@]} + ${#badly_formatted[@]} == 0 )); then
+    return 0
+  fi
+  report
+  ask_to_push_anyway
+}
+
+main

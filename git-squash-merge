@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+#
+# git-squash-merge: squash-merge the current branch's GitHub PR via gh,
+# with a message drafted in your editor (PR title, commit list, and
+# Pull-Request / Jira / Signed-off-by trailers).
+#
+# Usage:  git squash-merge
+#
+# The Jira ticket comes from the branch name (feature/PROJ-123), else
+# you are asked; it is optional. An aborted message is kept under .git/
+# for the next run. Branches are not deleted.
+#
+# Config: githelper.ticketPrefix  Jira project key (default: PROJ)
+
+# Stop on the first failing command (-e), on unset variables (-u), and
+# when any command in a pipeline fails (-o pipefail).
+set -euo pipefail
+
+# --- Settings --------------------------------------------------------------
+WIDTH=80                           # longer message lines get a warning
+# Jira project key, as in ACME-123. Set it once for all repos with:
+#   git config --global githelper.ticketPrefix ACME
+PREFIX=$(git config --get githelper.ticketPrefix || echo PROJ)
+if [[ ! $PREFIX =~ ^[A-Z][A-Z0-9]*$ ]]; then  # e.g. ACME or AB2
+  printf "warning: githelper.ticketPrefix '%s' is not a Jira key" "$PREFIX" >&2
+  printf ' (e.g. ACME); using PROJ\n' >&2
+  PREFIX=PROJ
+fi
+TICKET_RE="^($PREFIX-[0-9]+)"      # a ticket at the start of the last segment
+PR_KEY=Pull-Request                # trailer token, as in "Pull-Request: <url>"
+JIRA_KEY=Jira                      # trailer token, as in "Jira: PROJ-123"
+
+# --- State shared between the steps ------------------------------------------
+ticket=        # Jira ticket from the branch name or prompt; empty if none
+branch=        # current branch, the PR's head branch
+signoff=       # "Signed-off-by: Name <email>"
+pr=            # PR number; every gh call after the first uses it
+head_sha=      # PR head commit; the merge fails if the head moves
+state=         # OPEN, CLOSED or MERGED
+title=         # PR title, the default subject
+url=           # PR URL, e.g. https://github.com/owner/repo/pull/7
+base=          # branch the PR merges into, e.g. main
+approvals=     # number of approving reviews
+mergeable=     # MERGEABLE, CONFLICTING or UNKNOWN (not computed yet)
+commits=       # the PR's commits as a bullet list, for the draft body
+tmp=           # temp dir, deleted when the script exits
+message_file=  # the message; opened in the editor with the help appended
+saved=         # message kept under .git/ after an abort or failed merge
+
+# --- Small helpers -----------------------------------------------------------
+die() { 
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
+ask() {  # show a prompt, print the reply ("" on Enter or end of input)
+  local reply=
+  read -rp "$1 " reply || true
+  printf '%s' "$reply"
+}
+
+# Answers are single letters, matched case-insensitively.
+is_yes()  { [[ $1 == [yY] ]]; }
+is_no()   { [[ $1 == [nN] ]]; }
+is_edit() { [[ $1 == [eE] ]]; }
+
+view() {  # one field of the PR: view FIELD JQ-EXPRESSION
+  gh pr view "$pr" --json "$1" --jq "$2"
+}
+
+# --- Steps: checks before the editor opens -----------------------------------
+
+find_branch() {
+  if ! branch=$(git symbolic-ref --quiet --short HEAD); then
+    die "not on a branch (detached HEAD); check out the PR branch first"
+  fi
+}
+
+# The same rules as hooks/prepare-commit-msg: the ticket is the part
+# after the last "/" of the branch name, when it starts with
+# <prefix>-<digits> (feature/PROJ-123 -> PROJ-123). Otherwise you are asked;
+# Enter or an invalid answer means no Jira trailer.
+find_ticket() {
+  local last_segment typed_ticket
+  if [[ $branch == */* ]]; then
+    last_segment=${branch##*/}
+    if [[ $last_segment =~ $TICKET_RE ]]; then
+      ticket=${BASH_REMATCH[1]}
+      return 0
+    fi
+  fi
+  typed_ticket=$(ask "Jira ticket ($PREFIX-123, Enter to skip):")
+  if [[ -z $typed_ticket ]]; then
+    return 0
+  fi
+  if [[ $typed_ticket =~ ^$PREFIX-[0-9]+$ ]]; then
+    ticket=$typed_ticket
+  else
+    warn "'$typed_ticket' is not a $PREFIX-<digits> key; no $JIRA_KEY trailer added"
+  fi
+}
+
+find_identity() {  # the same identity `git commit -s` signs off with
+  local ident
+  # Honours committer.name/email and GIT_COMMITTER_* as well as user.*.
+  if ! ident=$(git var GIT_COMMITTER_IDENT); then
+    die "git cannot determine your identity; set user.name and user.email"
+  fi
+  # ident is "Name <email> 1700000000 +0100"; drop the last two words.
+  signoff="Signed-off-by: ${ident% * *}"
+}
+
+find_pr() {  # everything about the current branch's PR, in one gh call
+  local pr_info
+  # Output: eight values, one per line, then the commits as a bullet
+  # list: "* <subject>", then the body indented by two spaces (so a body
+  # line starting with "#" is not taken for a comment in the editor).
+  pr_info=$(gh pr view \
+    --json number,headRefOid,state,title,url,baseRefName,latestReviews,mergeable,commits \
+    --jq '.number, .headRefOid, .state, .title, .url, .baseRefName,
+    ([.latestReviews[] | select(.state == "APPROVED")] | length),
+    .mergeable,
+    (.commits[] |
+      "* \(.messageHeadline)\n",
+      (select(.messageBody != "") |
+        "  \(.messageBody | gsub("\n"; "\n  "))\n"))' |
+    tr -d '\r')
+  {
+    read -r pr
+    read -r head_sha
+    read -r state
+    IFS= read -r title  # IFS=: keep leading/trailing spaces
+    read -r url
+    read -r base
+    read -r approvals
+    read -r mergeable
+    commits=$(cat)      # the rest
+  } <<< "$pr_info"
+}
+
+# Open, no conflicts, approved (or you confirm), local branch == PR head.
+check_pr_is_mergeable() {
+  local local_sha
+  if [[ $state != OPEN ]]; then
+    die "PR #$pr for '$branch' is $state"
+  fi
+
+  # GitHub computes mergeability in the background; UNKNOWN means "not
+  # computed yet", so ask again a few times before giving up.
+  for _ in 1 2 3 4 5; do
+    if [[ $mergeable != UNKNOWN ]]; then
+      break
+    fi
+    sleep 2
+    mergeable=$(view mergeable .mergeable)
+  done
+  case $mergeable in
+    MERGEABLE) ;;
+    CONFLICTING)
+      die "PR #$pr has merge conflicts with '$base'. Merge or rebase" \
+          "'$base' into '$branch', resolve the conflicts, push, and rerun." ;;
+    *)
+      die "GitHub has not yet determined whether PR #$pr can be merged" \
+          "(mergeable: ${mergeable:-none}). Wait a moment and rerun." ;;
+  esac
+
+  if (( approvals == 0 )); then
+    warn "PR #$pr has no approving review"
+    if ! is_yes "$(ask "Continue anyway? [y/N]")"; then
+      die "aborted, nothing merged"
+    fi
+  fi
+
+  # Refuse rather than ask: GitHub merges the PR head, so unpushed
+  # commits would silently be left out of the merge.
+  local_sha=$(git rev-parse HEAD)
+  if [[ $local_sha != "$head_sha" ]]; then
+    die "local '$branch' is at ${local_sha:0:12}, PR #$pr head is" \
+        "${head_sha:0:12}. Push your commits (git push) or update" \
+        "(git pull), then rerun."
+  fi
+}
+
+# --- Message helpers ---------------------------------------------------------
+
+required_trailers() {  # one per line: PR, Jira (if there is a ticket), sign-off
+  printf '%s\n' "$PR_KEY: $url"
+  if [[ -n $ticket ]]; then
+    printf '%s\n' "$JIRA_KEY: $ticket"
+  fi
+  printf '%s\n' "$signoff"
+}
+
+missing_trailers() {  # print each required trailer that file $1 lacks
+  local trailer
+  while IFS= read -r trailer; do
+    if ! grep -qxF -- "$trailer" "$1"; then
+      printf '%s\n' "$trailer"
+    fi
+  done < <(required_trailers)
+}
+
+# True if the last paragraph of file $1 has a required trailer.
+ends_with_trailers() {
+  local trailer block
+  block=$(last_paragraph "$1")
+  while IFS= read -r trailer; do
+    if grep -qxF -- "$trailer" <<< "$block"; then
+      return 0
+    fi
+  done < <(required_trailers)
+  return 1
+}
+
+# Drop every comment line from file $1 and tidy whitespace, in place.
+# "#" is forced as the comment character, whatever core.commentChar says,
+# because that is what the help lines start with.
+strip_comments() {
+  git -c core.commentChar='#' stripspace --strip-comments < "$1" > "$1.new"
+  mv "$1.new" "$1"
+}
+
+# Everything after the subject (line 1) of file $1, minus the blank lines
+# it starts with. Line 2 need not be blank: gh gets the subject and body
+# separately, so the commit on $base always has a one-line subject.
+message_body() { tail -n +2 "$1" | sed '/./,$!d'; }
+
+# Paragraphs are separated by blank lines (awk's RS="" reads one per record).
+count_paragraphs() { awk 'BEGIN { RS = "" } END { print NR }' "$1"; }
+last_paragraph()   { awk 'BEGIN { RS = "" } { p = $0 } END { print p }' "$1"; }
+
+# Subject length, then long body lines (lines containing a URL are
+# exempt). These are only warnings; they never stop the merge.
+line_warnings() {
+  local line number=0
+  # ${#line} counts characters only in a UTF-8 locale, so force one here.
+  # ("é" and "—" are one character each, but two and three bytes.)
+  local LC_ALL=C.UTF-8
+  while IFS= read -r line || [[ -n $line ]]; do
+    number=$((number + 1))
+    if (( number == 1 )); then
+      if (( ${#line} > WIDTH )); then
+        printf 'subject is %d chars (max %d)\n' "${#line}" "$WIDTH"
+      fi
+      continue
+    fi
+    if (( ${#line} > WIDTH )) && [[ $line != *://* ]]; then
+      printf 'line %d is %d chars (max %d)\n' "$number" "${#line}" "$WIDTH"
+    fi
+  done < "$1"
+}
+
+# Print every trailer problem with file $1; fail if any. A removed
+# trailer is not a problem here (show_final_message warns about it), but
+# git only reads trailers from a last paragraph of "Key: value" lines.
+validate_message() {
+  local file=$1 trailer count trailer_block errors=()
+  trailer_block=$(last_paragraph "$file")
+
+  # Each required trailer that is present: once, in the last paragraph...
+  while IFS= read -r trailer; do
+    count=$(grep -cxF -- "$trailer" "$file" || true)
+    if (( count > 1 )); then
+      errors+=("'$trailer' must appear at most once (found $count)")
+    elif (( count == 1 )) && ! grep -qxF -- "$trailer" <<< "$trailer_block"; then
+      errors+=("'$trailer' must be in the last paragraph, with the other trailers")
+    fi
+  done < <(required_trailers)
+  # ...and that paragraph is all "Key: value" lines, not mixed with text.
+  if ends_with_trailers "$file" &&
+     grep -qvE '^[A-Za-z0-9-]+: ' <<< "$trailer_block"; then
+    errors+=("trailers must be their own last paragraph, after a blank line")
+  fi
+
+  if (( ${#errors[@]} == 0 )); then
+    return 0
+  fi
+  printf '  - %s\n' "${errors[@]}" >&2
+  return 1
+}
+
+# --- Steps: draft, edit, merge -----------------------------------------------
+
+create_temp_files() {
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  message_file=$tmp/COMMIT_EDITMSG  # this name puts editors in git-commit mode
+  # Lives under .git/, so it survives the cleanup above. One per PR.
+  saved=$(git rev-parse --path-format=absolute \
+    --git-path "squash-merge-msg-$pr")
+}
+
+abort() {  # keep the message from file $1 for the next run, then stop
+  cp "$1" "$saved"
+  die "aborted, nothing merged; your message is saved in $saved" \
+      "and will be offered when you rerun."
+}
+
+help_text() {  # the instructions, as comment lines below the message
+  local ruler="#"
+  while (( ${#ruler} < WIDTH - 1 )); do
+    ruler+="-"
+  done
+  ruler+="|"   # exactly $WIDTH characters, so you can see the limit
+
+  cat <<EOF
+
+# Squash-merging PR #$pr ($branch -> $base) at ${head_sha:0:12}
+#
+# Lines starting with '#' are ignored, including any you write.
+#
+# HOW TO WRITE THIS MESSAGE
+#
+#   Line 1   Subject: what the change does, in the imperative
+#            ("Add ...", "Fix ..."). Up to $WIDTH characters,
+#            ideally 50 or fewer. No PR number; that goes in the
+#            trailers.
+#
+#   Line 2   Leave blank.
+#
+#   Line 3   Body: explain what changed and why. It starts as the
+#   onwards  list of this PR's commits; rewrite it or delete what
+#            is not useful. Separate paragraphs with blank lines.
+#
+#   Last     Trailers, separated from the body by ONE blank line:
+$(required_trailers | sed '1s/^/#   lines      /; 2,$s/^/#              /')
+#            Keep them unless you mean to drop one: a deleted
+#            trailer is not added back, you only get a warning.
+#            Other trailers (e.g. Co-authored-by:) go
+#            on lines next to them, with no blank line in between.
+#
+# WRAPPING: this script does NOT wrap anything. Break every line
+# yourself so that no line is longer than $WIDTH characters. Lines
+# containing a URL are exempt. For reference, the next line is
+# exactly $WIDTH characters long:
+$ruler
+#
+# After you save and close the editor, the message is checked.
+# Problems with the trailers must be fixed: you are told what and can
+# edit again. Longer lines are only warned about. Nothing is merged
+# until you confirm the final message.
+EOF
+}
+
+# The saved message from an earlier run, as you left it; or a fresh
+# draft: PR title, blank line, the commits, blank line, the trailers.
+prepare_draft() {
+  if [[ -s $saved ]] &&
+     ! is_no "$(ask "Start from the message saved by an earlier run? [Y/n]")"
+  then
+    cp "$saved" "$message_file"
+  else
+    # stripspace drops trailing spaces and collapses repeated blank lines.
+    printf '%s\n\n%s\n\n%s\n' "$title" "$commits" "$(required_trailers)" |
+      git stripspace > "$message_file"
+  fi
+}
+
+show_final_message() {  # the message, then any warnings about it
+  local problem trailer body_paragraphs
+  printf '\n----- final commit message -----\n'
+  cat "$message_file"
+  printf -- '--------------------------------\n'
+  # The body is what follows the subject, minus the trailers paragraph.
+  body_paragraphs=$(count_paragraphs <(message_body "$message_file"))
+  if ends_with_trailers "$message_file"; then
+    body_paragraphs=$((body_paragraphs - 1))
+  fi
+  if (( body_paragraphs == 0 )); then
+    warn "the commit body is empty"
+  fi
+  while IFS= read -r trailer; do
+    warn "no '$trailer' trailer"
+  done < <(missing_trailers "$message_file")
+  while IFS= read -r problem; do
+    warn "$problem"
+  done < <(line_warnings "$message_file")
+}
+
+# Open the editor until the message passes every check and you confirm
+# it. Answering anything other than "yes" or "edit" saves the message
+# and stops; an editor error or an empty message stops without saving.
+edit_until_confirmed() {
+  local editor answer
+  editor=$(git var GIT_EDITOR)
+  while true; do
+    help_text >> "$message_file"
+    # GIT_EDITOR may contain arguments (e.g. "code --wait"), so run it
+    # through sh, as git itself does.
+    sh -c "$editor \"\$@\"" editor "$message_file" ||
+      die "editor exited with an error"
+
+    strip_comments "$message_file"
+    if [[ ! -s $message_file ]]; then
+      die "empty commit message, aborting"
+    fi
+
+    if validate_message "$message_file"; then
+      show_final_message
+      answer=$(ask "Squash-merge PR #$pr into $base? [y]es/[e]dit/[N]o:")
+    else
+      answer=$(ask "Fix the problems above? [e]dit/[N] abort:")
+      if ! is_edit "$answer"; then
+        answer=n
+      fi
+    fi
+
+    if is_yes "$answer"; then
+      break
+    elif is_edit "$answer"; then
+      continue
+    else
+      abort "$message_file"
+    fi
+  done
+}
+
+merge_pr() {
+  local subject args
+  # gh takes the subject and the body separately.
+  subject=$(head -n1 "$message_file")
+  message_body "$message_file" > "$tmp/body"
+  # No --delete-branch: gh would then delete both branches and switch
+  # you to $base.
+  args=(--squash --subject "$subject" --body-file "$tmp/body"
+        --match-head-commit "$head_sha")
+
+  if ! gh pr merge "$pr" "${args[@]}"; then
+    # gh can report a failure after GitHub has already merged (e.g. the
+    # connection dropped while it waited for the answer). That is a
+    # success, so check before treating it as a failure.
+    if [[ $(view state .state || true) != MERGED ]]; then
+      cp "$message_file" "$saved"
+      die "merging PR #$pr failed; your message is saved in $saved" \
+          "and will be offered when you rerun."
+    fi
+    warn "PR #$pr was merged, but gh reported an error (see above)"
+  fi
+  rm -f "$saved"
+}
+
+print_merge_commit_link() {  # GitHub can take a moment to report it
+  local sha=
+  for _ in 1 2 3 4 5; do
+    sha=$(view mergeCommit '.mergeCommit.oid // empty')
+    if [[ -n $sha ]]; then
+      break
+    fi
+    sleep 2
+  done
+  echo
+  if [[ -n $sha ]]; then
+    echo "Merged PR #$pr into $base as ${sha:0:12}:"
+    # ${url%/pull/*} is the repo URL: the PR URL minus "/pull/<n>".
+    echo "  ${url%/pull/*}/commit/$sha"
+  else
+    warn "merged, but GitHub has not reported the commit yet; see $url"
+  fi
+}
+
+# --- Main --------------------------------------------------------------------
+
+main() {
+  find_branch
+  find_ticket
+  find_identity
+  find_pr
+  check_pr_is_mergeable
+
+  create_temp_files
+  prepare_draft
+  edit_until_confirmed
+  merge_pr
+  print_merge_commit_link
+}
+
+main "$@"

@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+#
+# prepare-commit-msg: add a "Jira: PROJ-123" trailer from the branch
+# name (feature/PROJ-123), or ask for one when there is a terminal.
+# Skipped for merge/squash messages, amends, and existing trailers.
+#
+# Config: githelper.ticketPrefix  Jira project key (default: PROJ)
+#
+# Install, per repo:
+#   ln -s ~/git-helper/hooks/prepare-commit-msg .git/hooks/
+
+# Stop on the first failing command (-e), on unset variables (-u), and
+# when any command in a pipeline fails (-o pipefail).
+set -euo pipefail
+
+# --- Settings --------------------------------------------------------------
+# Jira project key, as in ACME-123. Set it once for all repos with:
+#   git config --global githelper.ticketPrefix ACME
+PREFIX=$(git config --get githelper.ticketPrefix || echo PROJ)
+if [[ ! $PREFIX =~ ^[A-Z][A-Z0-9]*$ ]]; then  # what Jira allows
+  printf "warning: githelper.ticketPrefix '%s' is not a Jira key" "$PREFIX" >&2
+  printf ' (e.g. ACME); using PROJ\n' >&2
+  PREFIX=PROJ
+fi
+TICKET_RE="^($PREFIX-[0-9]+)"  # a ticket at the start of the last segment
+JIRA_KEY=Jira                  # trailer token, as in "Jira: PROJ-123"
+
+# --- State -------------------------------------------------------------------
+# Git passes these: the message file, then where the message comes from
+# (empty, message, template, merge, squash or commit).
+message_file=$1
+source=${2:-}
+ticket=        # Jira key found in the branch name, e.g. PROJ-123
+
+# --- Steps -------------------------------------------------------------------
+
+find_branch_ticket() {  # ticket from "<name>/PROJ-123...", if there is one
+  local branch last_segment
+  # Detached HEAD: no branch, so no ticket.
+  if ! branch=$(git symbolic-ref --quiet --short HEAD); then
+    return 0
+  fi
+  if [[ $branch != */* ]]; then
+    return 0
+  fi
+  last_segment=${branch##*/}
+  if [[ $last_segment =~ $TICKET_RE ]]; then
+    ticket=${BASH_REMATCH[1]}
+  fi
+}
+
+skip_generated_messages() {  # merge and squash messages are git's, not ours
+  case $source in
+    merge|squash) exit 0 ;;
+  esac
+}
+
+has_jira_trailer() {  # the message already has a "Jira: ..." trailer
+  git interpret-trailers --parse "$message_file" | grep -q "^$JIRA_KEY: "
+}
+
+ask_for_ticket() {  # no ticket in the branch: ask, unless there's no point
+  local tty=${GIT_JIRA_TTY:-/dev/tty} reply=
+  # Amend, -c and -C reuse a message that was already decided on.
+  if [[ $source == commit ]] || has_jira_trailer; then
+    return 0
+  fi
+  # Git gives hooks no stdin, so talk to the terminal directly. No
+  # terminal (e.g. an IDE commit dialog): carry on without asking.
+  if ! { exec 3< "$tty"; } 2>/dev/null; then
+    return 0
+  fi
+  printf 'Jira ticket (%s-123, Enter to skip): ' "$PREFIX" >&2
+  read -r reply <&3 || true
+  exec 3<&-
+  if [[ -z $reply ]]; then
+    return 0
+  fi
+  if [[ $reply =~ ^$PREFIX-[0-9]+$ ]]; then
+    ticket=$reply
+  else
+    printf "warning: '%s' is not a %s-<digits> key; no %s trailer added\n" \
+      "$reply" "$PREFIX" "$JIRA_KEY" >&2
+  fi
+}
+
+has_no_text() {  # the message is only blank lines and comments so far
+  [[ -z $(git stripspace --strip-comments < "$message_file") ]]
+}
+
+add_trailer() {  # add "Jira: <ticket>" to the message, unless already there
+  local rest
+  if has_no_text; then
+    # interpret-trailers would put the trailer on line 2, right under the
+    # subject you are about to type. Leave the subject and a blank line
+    # free instead; git's comments follow.
+    rest=$(sed '/./,$!d' "$message_file")  # drop leading blank lines
+    printf '\n\n%s: %s\n\n%s\n' "$JIRA_KEY" "$ticket" "$rest" > "$message_file"
+    return 0
+  fi
+  # --where start: Jira before Signed-off-by, as git-squash-merge orders them.
+  git interpret-trailers --in-place --no-divider --if-exists addIfDifferent \
+    --where start --trailer "$JIRA_KEY: $ticket" "$message_file"
+}
+
+# --- Main ----------------------------------------------------------------------
+
+main() {
+  skip_generated_messages
+  find_branch_ticket
+  if [[ -z $ticket ]]; then
+    ask_for_ticket
+  fi
+  if [[ -n $ticket ]]; then
+    add_trailer
+  fi
+}
+
+main
